@@ -1,5 +1,8 @@
 import { initVision, isReady as visionReady, detectPose, computeAngles, assessForm, drawSkeleton, buildVisionPayload, analyzeGaitCycle } from "./vision.js";
 import { parseFitFile } from "./fit-parser.js";
+import { synchronize, buildCalibrationProfile, inferFromTelemetry, detectFormChanges } from "./calibration.js";
+import { createSimulatedStream, createInferenceEngine, buildGemmaInferencePayload } from "./telemetry-inference.js";
+import { computeCalibrationHeuristics } from "./vision.js";
 
 const METRICS = {
   cadence: { label: "Cadence", unit: "spm", color: "#ff9b83", aliases: ["cadence", "runcadence", "cadencespm", "spm"] },
@@ -82,6 +85,22 @@ const state = {
       "badge-pdf": false,
       "badge-perfect": false
     }
+  },
+  calibration: {
+    profile: null,
+    status: "No calibration profile loaded.",
+    calibVideoFile: null,
+    calibFitFile: null,
+    syncedPairs: [],
+    heuristics: null
+  },
+  inference: {
+    stream: null,
+    engine: null,
+    telemetryRows: [],
+    running: false,
+    status: "Load a calibration profile first.",
+    latestCue: ""
   }
 };
 
@@ -186,7 +205,30 @@ const el = {
   // Gamification
   playerLevelBadge: qs("#playerLevelBadge"),
   playerXpLabel: qs("#playerXpLabel"),
-  playerXpFill: qs("#playerXpFill")
+  playerXpFill: qs("#playerXpFill"),
+  // Calibration & Inference
+  calibVideoInput: qs("#calibVideoInput"),
+  calibFitInput: qs("#calibFitInput"),
+  calibVideoOffsetInput: qs("#calibVideoOffsetInput"),
+  runCalibrationButton: qs("#runCalibrationButton"),
+  calibrationStatus: qs("#calibrationStatus"),
+  calibProfilePanel: qs("#calibProfilePanel"),
+  calibProfileSummary: qs("#calibProfileSummary"),
+  calibRegressionGrid: qs("#calibRegressionGrid"),
+  inferenceFitInput: qs("#inferenceFitInput"),
+  inferenceSpeedSelect: qs("#inferenceSpeedSelect"),
+  startInferenceButton: qs("#startInferenceButton"),
+  stopInferenceButton: qs("#stopInferenceButton"),
+  inferenceStatus: qs("#inferenceStatus"),
+  inferenceDashboard: qs("#inferenceDashboard"),
+  inferTorsoLean: qs("#inferTorsoLean"),
+  inferVerticalBounce: qs("#inferVerticalBounce"),
+  inferStrideAsymmetry: qs("#inferStrideAsymmetry"),
+  inferConfidence: qs("#inferConfidence"),
+  inferChangesList: qs("#inferChangesList"),
+  inferCoachingCues: qs("#inferCoachingCues"),
+  inferProgressBar: qs("#inferProgressBar"),
+  inferProgressLabel: qs("#inferProgressLabel")
 };
 
 el.gemmaModelInput.value = DEFAULT_MODEL;
@@ -258,6 +300,47 @@ el.copyPayloadButton.addEventListener("click", async () => {
 el.generateGemmaButton.addEventListener("click", generateGemma);
 el.chatForm?.addEventListener("submit", submitChat);
 el.resetChatButton?.addEventListener("click", resetChat);
+
+// Calibration & Inference event listeners
+el.calibVideoInput?.addEventListener("change", ({ target }) => {
+  state.calibration.calibVideoFile = target.files[0] || null;
+});
+el.calibFitInput?.addEventListener("change", ({ target }) => {
+  state.calibration.calibFitFile = target.files[0] || null;
+});
+el.runCalibrationButton?.addEventListener("click", runCalibration);
+el.inferenceFitInput?.addEventListener("change", async ({ target }) => {
+  const file = target.files[0];
+  if (!file) return;
+  try {
+    if (file.name.toLowerCase().endsWith(".fit")) {
+      const buffer = await file.arrayBuffer();
+      const { rows } = parseFitFile(buffer);
+      state.inference.telemetryRows = rows.map((r, i) => ({
+        timeSeconds: i,
+        cadence: r.cadence,
+        verticalOscillation: r.vertical_oscillation_mm,
+        groundContactTime: r.ground_contact_time_ms,
+        strideLength: r.stride_length_m,
+        pace: r.pace,
+        heartRate: r.heart_rate,
+        gctBalance: r.gct_balance
+      }));
+    } else {
+      // CSV fallback: use the existing parser
+      const text = await file.text();
+      state.inference.telemetryRows = parseInferenceCsv(text);
+    }
+    state.inference.status = `Loaded ${state.inference.telemetryRows.length} telemetry rows from ${file.name}.`;
+    if (state.calibration.profile) el.startInferenceButton.disabled = false;
+    el.inferenceStatus.textContent = state.inference.status;
+  } catch (err) {
+    state.inference.status = `Error loading file: ${err.message}`;
+    el.inferenceStatus.textContent = state.inference.status;
+  }
+});
+el.startInferenceButton?.addEventListener("click", startInferenceDemo);
+el.stopInferenceButton?.addEventListener("click", stopInferenceDemo);
 document.querySelectorAll(".suggestion-chip").forEach((chip) => {
   chip.addEventListener("click", () => {
     if (el.chatInput && !state.chat.running) {
@@ -2739,6 +2822,293 @@ async function trainAllFitData() {
   } catch (err) {
     fitTrainingStatus.textContent = `❌ Training failed: ${err.message}. FIT data parsed successfully — retry when Gemma is online.`;
   }
+}
+
+// ═══════════ Calibration & Inference Engine ═══════════
+
+/**
+ * Run the full calibration pipeline:
+ * 1. Extract frames from calibration video
+ * 2. Run pose detection on each frame
+ * 3. Compute calibration heuristics (torso lean, cadence, asymmetry, bounce)
+ * 4. Parse the matching FIT/CSV telemetry
+ * 5. Synchronize video frames with telemetry by timestamp
+ * 6. Build a calibration profile (regression + kNN lookup table)
+ */
+async function runCalibration() {
+  const videoFile = state.calibration.calibVideoFile;
+  const fitFile = state.calibration.calibFitFile;
+  if (!videoFile) { window.alert("Please select a calibration video."); return; }
+  if (!fitFile) { window.alert("Please select a matching FIT/CSV file."); return; }
+
+  const statusEl = el.calibrationStatus;
+  statusEl.textContent = "Extracting video frames...";
+  el.runCalibrationButton.disabled = true;
+
+  try {
+    // Step 1: Extract frames from calibration video (denser sampling for calibration)
+    const videoUrl = URL.createObjectURL(videoFile);
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.src = videoUrl;
+    await once(video, "loadedmetadata");
+
+    const canvas = document.createElement("canvas");
+    const scale = Math.min(1, 720 / video.videoWidth);
+    canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+    canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+    const context = canvas.getContext("2d");
+    const fps = 30; // assumed
+    const durationMs = video.duration * 1000;
+
+    // Sample more frames for calibration (every 200ms or ~5 fps)
+    const sampleIntervalMs = 200;
+    const frameCount = Math.min(50, Math.floor(durationMs / sampleIntervalMs));
+    const calibFrames = [];
+
+    statusEl.textContent = `Extracting ${frameCount} frames from calibration video...`;
+
+    for (let i = 0; i < frameCount; i++) {
+      const timeMs = i * sampleIntervalMs;
+      video.currentTime = Math.min(video.duration - 0.05, timeMs / 1000);
+      await once(video, "seeked");
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.74);
+      calibFrames.push({ label: `${Math.round(timeMs)}ms`, dataUrl, timestampMs: timeMs });
+    }
+    URL.revokeObjectURL(videoUrl);
+
+    // Step 2: Run pose detection on each frame
+    statusEl.textContent = `Running pose detection on ${calibFrames.length} frames...`;
+    const frameAnalyses = [];
+    for (const frame of calibFrames) {
+      if (visionReady()) {
+        const img = new Image();
+        img.src = frame.dataUrl;
+        await new Promise(r => { img.onload = r; });
+        const landmarks = detectPose(img);
+        const angles = landmarks ? computeAngles(landmarks) : null;
+        const assessment = angles ? assessForm(angles) : null;
+        frameAnalyses.push({ label: frame.label, landmarks, angles, assessment, timestampMs: frame.timestampMs });
+      } else {
+        frameAnalyses.push({ label: frame.label, landmarks: null, angles: null, assessment: null, timestampMs: frame.timestampMs });
+      }
+    }
+
+    const detectedCount = frameAnalyses.filter(f => f.landmarks).length;
+    statusEl.textContent = `Pose detected in ${detectedCount}/${calibFrames.length} frames. Computing heuristics...`;
+
+    // Step 3: Compute calibration heuristics
+    const heuristics = computeCalibrationHeuristics(frameAnalyses, fps);
+    state.calibration.heuristics = heuristics;
+
+    // Step 4: Parse the FIT/CSV telemetry
+    statusEl.textContent = "Parsing telemetry data...";
+    let telemetryRows;
+    if (fitFile.name.toLowerCase().endsWith(".fit")) {
+      const buffer = await fitFile.arrayBuffer();
+      const { rows } = parseFitFile(buffer);
+      telemetryRows = rows.map((r, i) => ({
+        timeSeconds: i,
+        cadence: r.cadence,
+        verticalOscillation: r.vertical_oscillation_mm,
+        groundContactTime: r.ground_contact_time_ms,
+        strideLength: r.stride_length_m,
+        pace: r.pace,
+        heartRate: r.heart_rate,
+        gctBalance: r.gct_balance
+      }));
+    } else {
+      const text = await fitFile.text();
+      telemetryRows = parseInferenceCsv(text);
+    }
+
+    // Step 5: Synchronize
+    statusEl.textContent = "Synchronizing video and telemetry...";
+    const videoOffsetMin = parseFloat(el.calibVideoOffsetInput?.value || "0");
+    const syncResult = synchronize({
+      videoHeuristics: heuristics.perFrame,
+      telemetryRows,
+      videoStartOffsetSeconds: videoOffsetMin * 60,
+      maxGapSeconds: 5
+    });
+    state.calibration.syncedPairs = syncResult.pairs;
+
+    // Step 6: Build calibration profile
+    statusEl.textContent = "Building calibration profile...";
+    const profile = buildCalibrationProfile(syncResult.pairs);
+    state.calibration.profile = profile;
+
+    if (!profile.valid) {
+      statusEl.textContent = `Calibration failed: ${profile.reason}`;
+      el.runCalibrationButton.disabled = false;
+      return;
+    }
+
+    // Render profile summary
+    renderCalibrationProfile(profile, heuristics, syncResult.stats);
+    statusEl.textContent = `Calibration complete. ${syncResult.stats.matched} pairs synchronized (avg gap: ${syncResult.stats.avgGapMs}ms). Profile ready for inference.`;
+    state.calibration.status = statusEl.textContent;
+
+    // Enable inference
+    el.inferenceStatus.textContent = "Calibration profile loaded. Upload a FIT file to start inference.";
+    if (state.inference.telemetryRows.length > 0) {
+      el.startInferenceButton.disabled = false;
+    }
+
+  } catch (err) {
+    statusEl.textContent = `Calibration error: ${err.message}`;
+    console.error("Calibration failed:", err);
+  }
+
+  el.runCalibrationButton.disabled = false;
+}
+
+function renderCalibrationProfile(profile, heuristics, syncStats) {
+  if (!el.calibProfilePanel) return;
+  el.calibProfilePanel.style.display = "block";
+
+  // Summary
+  el.calibProfileSummary.innerHTML = `
+    <p><strong>Samples:</strong> ${profile.sampleCount} synchronized pairs</p>
+    <p><strong>Avg Sync Gap:</strong> ${syncStats.avgGapMs}ms</p>
+    <p><strong>Video Cadence:</strong> ${heuristics.cadence ?? "N/A"} spm</p>
+    <p><strong>Avg Torso Lean:</strong> ${heuristics.torsoLean ?? "N/A"}&deg;</p>
+    <p><strong>Avg Vertical Bounce:</strong> ${heuristics.verticalBounce ?? "N/A"}</p>
+    <p><strong>Avg Stride Asymmetry:</strong> ${heuristics.strideAsymmetry ?? "N/A"}</p>
+  `;
+
+  // Regression cards
+  const grid = el.calibRegressionGrid;
+  grid.innerHTML = "";
+  for (const poseKey of profile.poseKeys) {
+    for (const telKey of profile.telemetryKeys) {
+      const reg = profile.regressions[poseKey]?.[telKey];
+      if (!reg || reg.r2 === null || reg.r2 < 0.01) continue;
+      const r2Pct = Math.round(reg.r2 * 100);
+      const color = r2Pct > 50 ? "#7ed6af" : r2Pct > 25 ? "#f3a12b" : "var(--muted)";
+      const card = document.createElement("div");
+      card.style.cssText = `background: rgba(255,255,255,0.03); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 0.8rem;`;
+      card.innerHTML = `
+        <div style="color: ${color}; font-weight: 700; margin-bottom: 4px;">${telKey} &rarr; ${poseKey}</div>
+        <div style="color: var(--muted);">R&sup2; = ${r2Pct}% (n=${reg.n})</div>
+        <div style="color: var(--muted);">y = ${reg.slope}x + ${reg.intercept}</div>
+      `;
+      grid.appendChild(card);
+    }
+  }
+}
+
+/**
+ * Parse a CSV file into telemetry rows for inference.
+ */
+function parseInferenceCsv(text) {
+  const lines = text.trim().split(/\r?\n/).filter(Boolean);
+  const headers = lines.shift().split(",").map(h => h.trim().toLowerCase().replace(/[^a-z0-9]/g, ""));
+  return lines.map((line, i) => {
+    const values = line.split(",").map(v => v.trim());
+    const row = { timeSeconds: i };
+    headers.forEach((h, j) => {
+      const val = parseFloat(values[j]);
+      if (h.includes("cadence")) row.cadence = val;
+      else if (h.includes("verticaloscillation") || h === "vo") row.verticalOscillation = val;
+      else if (h.includes("groundcontacttime") || h === "gct") row.groundContactTime = val;
+      else if (h.includes("stridelength") || h === "stride") row.strideLength = val;
+      else if (h.includes("pace")) row.pace = val;
+      else if (h.includes("heartrate") || h === "hr") row.heartRate = val;
+      else if (h.includes("gctbalance")) row.gctBalance = val;
+    });
+    return row;
+  });
+}
+
+/**
+ * Start the real-time inference demo with a simulated Garmin stream.
+ */
+function startInferenceDemo() {
+  if (!state.calibration.profile?.valid) {
+    el.inferenceStatus.textContent = "No valid calibration profile. Run calibration first.";
+    return;
+  }
+  if (!state.inference.telemetryRows.length) {
+    el.inferenceStatus.textContent = "No telemetry data loaded. Upload a FIT/CSV file.";
+    return;
+  }
+
+  // Stop any existing stream
+  stopInferenceDemo();
+
+  const speed = parseInt(el.inferenceSpeedSelect?.value || "10");
+  el.inferenceDashboard.style.display = "block";
+  el.startInferenceButton.disabled = true;
+  el.stopInferenceButton.disabled = false;
+  state.inference.running = true;
+
+  // Create inference engine
+  state.inference.engine = createInferenceEngine(state.calibration.profile, {
+    windowSize: 5,
+    cueIntervalSeconds: 15,
+    onFormUpdate({ inferred, changes, confidence }) {
+      // Update dashboard cards
+      el.inferTorsoLean.textContent = inferred.torsoLean != null ? `${inferred.torsoLean}\u00B0` : "--";
+      el.inferVerticalBounce.textContent = inferred.verticalBounce != null ? `${inferred.verticalBounce}` : "--";
+      el.inferStrideAsymmetry.textContent = inferred.strideAsymmetry != null ? `${inferred.strideAsymmetry}` : "--";
+      el.inferConfidence.textContent = confidence || "--";
+
+      // Color code confidence
+      const confColors = { high: "#7ed6af", medium: "#f3a12b", low: "#f36b6d" };
+      el.inferConfidence.style.color = confColors[confidence] || "var(--text)";
+
+      // Render form changes
+      if (changes.length) {
+        el.inferChangesList.innerHTML = changes.map(c => {
+          const icon = c.severity === "bad" ? "\ud83d\udd34" : c.severity === "warn" ? "\ud83d\udfe1" : "\ud83d\udfe2";
+          return `<div style="margin-bottom: 6px;">${icon} <strong>${c.metric}:</strong> ${c.current} (baseline: ${c.baseline}, ${c.direction} by ${Math.abs(c.delta)}) - ${c.description}</div>`;
+        }).join("");
+      } else {
+        el.inferChangesList.innerHTML = `<div style="color: #7ed6af;">\u2713 All metrics within calibration baseline.</div>`;
+      }
+    },
+    onCoachingCue({ cue, changes }) {
+      state.inference.latestCue = cue;
+      el.inferCoachingCues.innerHTML = `<div style="background: rgba(243,161,43,0.08); border: 1px solid rgba(243,161,43,0.2); border-radius: 8px; padding: 12px; margin-bottom: 8px; line-height: 1.5;">${escapeHtml(cue)}</div>` + el.inferCoachingCues.innerHTML;
+    }
+  });
+
+  // Create simulated stream
+  state.inference.stream = createSimulatedStream(state.inference.telemetryRows, {
+    speedMultiplier: speed,
+    onTick(row, index, total) {
+      state.inference.engine.processSnapshot(row);
+      const pct = Math.round((index / total) * 100);
+      el.inferProgressBar.style.width = `${pct}%`;
+      el.inferProgressLabel.textContent = `${index + 1} / ${total} (${pct}%)`;
+    },
+    onComplete() {
+      state.inference.running = false;
+      el.inferenceStatus.textContent = "Stream complete.";
+      el.startInferenceButton.disabled = false;
+      el.stopInferenceButton.disabled = true;
+      el.inferProgressBar.style.width = "100%";
+    }
+  });
+
+  el.inferenceStatus.textContent = `Streaming at ${speed}x speed...`;
+  state.inference.stream.start();
+}
+
+function stopInferenceDemo() {
+  if (state.inference.stream) {
+    state.inference.stream.stop();
+    state.inference.stream = null;
+  }
+  state.inference.running = false;
+  el.startInferenceButton.disabled = !state.calibration.profile?.valid || !state.inference.telemetryRows.length;
+  el.stopInferenceButton.disabled = true;
+  el.inferenceStatus.textContent = state.calibration.profile?.valid
+    ? "Stream stopped. Ready to restart."
+    : "Load a calibration profile first.";
 }
 
 // ═══════════ OCR Dot Tracking ═══════════

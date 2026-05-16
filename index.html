@@ -741,6 +741,118 @@
         </article>
       </section>
 
+      <!-- ═══════════ TAB: Calibrate ═══════════ -->
+      <section class="tab-pane" data-pane="calibrate" id="pane-calibrate">
+        <article class="panel" style="padding: 24px;">
+          <button type="button" class="back-to-dashboard-btn" onclick="switchTab('dashboard')">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 19l-7-7 7-7" /></svg> Back to Dashboard
+          </button>
+
+          <div class="panel-heading" style="margin-top: 16px;">
+            <div>
+              <p class="eyebrow">Calibration & Inference</p>
+              <h2>Telemetry-to-Form Mapping</h2>
+            </div>
+          </div>
+          <p style="color: var(--muted); font-size: 0.9rem; margin-bottom: 20px; line-height: 1.5;">
+            Calibrate the system by recording a short video alongside Garmin telemetry. Once calibrated, the system can infer your running form from wearable data alone.
+          </p>
+
+          <!-- Step 1: Calibration -->
+          <div style="background: rgba(0,229,255,0.05); border: 1px solid rgba(0,229,255,0.2); border-radius: 12px; padding: 20px; margin-bottom: 20px;">
+            <h3 style="color: var(--accent); margin-top: 0;">Step 1: Build Calibration Profile</h3>
+            <p style="font-size: 0.85rem; color: var(--muted); margin-bottom: 12px;">Upload a calibration video and the matching Garmin FIT file from the same run. Specify when in the run the video was recorded.</p>
+            <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px;">
+              <label class="file-button primary" style="margin: 0;">
+                <input id="calibVideoInput" type="file" accept="video/mp4,video/quicktime,video/webm" />
+                <span>Calibration Video</span>
+              </label>
+              <label class="file-button primary" style="margin: 0;">
+                <input id="calibFitInput" type="file" accept=".fit,.FIT,.csv" />
+                <span>Matching FIT/CSV</span>
+              </label>
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <label style="font-size: 0.82rem; color: var(--muted);">Video starts at (min):</label>
+                <input id="calibVideoOffsetInput" type="number" value="0" min="0" step="0.5" style="width: 70px; background: rgba(0,0,0,0.3); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; color: #fff; font-size: 0.85rem;" />
+              </div>
+            </div>
+            <button id="runCalibrationButton" type="button" style="background: rgba(0,229,255,0.2); color: #fff; border: 1px solid var(--accent); padding: 10px 20px; border-radius: 8px; font-weight: 700; cursor: pointer;">Run Calibration</button>
+            <div id="calibrationStatus" style="margin-top: 12px; font-size: 0.85rem; color: var(--muted);">No calibration profile loaded.</div>
+          </div>
+
+          <!-- Step 2: Profile Summary -->
+          <div id="calibProfilePanel" style="background: rgba(126,214,175,0.05); border: 1px solid rgba(126,214,175,0.2); border-radius: 12px; padding: 20px; margin-bottom: 20px; display: none;">
+            <h3 style="color: #7ed6af; margin-top: 0;">Calibration Profile</h3>
+            <div id="calibProfileSummary" style="font-size: 0.85rem; color: var(--text); line-height: 1.6;"></div>
+            <div id="calibRegressionGrid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin-top: 16px;"></div>
+          </div>
+
+          <!-- Step 3: Real-time Telemetry Inference -->
+          <div style="background: rgba(243,161,43,0.05); border: 1px solid rgba(243,161,43,0.2); border-radius: 12px; padding: 20px; margin-bottom: 20px;">
+            <h3 style="color: var(--amber); margin-top: 0;">Step 2: Real-Time Inference Demo</h3>
+            <p style="font-size: 0.85rem; color: var(--muted); margin-bottom: 12px;">Load a FIT file and simulate a live Garmin stream. The system will infer your form from telemetry alone using the calibration profile.</p>
+            <div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px;">
+              <label class="file-button" style="margin: 0; border-color: rgba(243,161,43,0.5);">
+                <input id="inferenceFitInput" type="file" accept=".fit,.FIT,.csv" />
+                <span style="color: var(--amber);">Load Run Data</span>
+              </label>
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <label style="font-size: 0.82rem; color: var(--muted);">Speed:</label>
+                <select id="inferenceSpeedSelect" style="background: rgba(0,0,0,0.3); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; color: #fff; font-size: 0.85rem;">
+                  <option value="5">5x</option>
+                  <option value="10" selected>10x</option>
+                  <option value="20">20x</option>
+                  <option value="50">50x</option>
+                </select>
+              </div>
+              <button id="startInferenceButton" type="button" disabled style="background: rgba(243,161,43,0.2); color: #fff; border: 1px solid var(--amber); padding: 10px 20px; border-radius: 8px; font-weight: 700; cursor: pointer;">Start Stream</button>
+              <button id="stopInferenceButton" type="button" disabled style="background: rgba(255,51,102,0.15); color: #fff; border: 1px solid var(--red); padding: 10px 16px; border-radius: 8px; font-weight: 700; cursor: pointer;">Stop</button>
+            </div>
+            <div id="inferenceStatus" style="font-size: 0.85rem; color: var(--muted); margin-bottom: 12px;">Load a calibration profile first.</div>
+
+            <!-- Live Inference Dashboard -->
+            <div id="inferenceDashboard" style="display: none;">
+              <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px;">
+                <div class="summary-card" style="text-align: center;">
+                  <p class="eyebrow">Torso Lean</p>
+                  <h3 id="inferTorsoLean" style="font-size: 1.6rem;">--</h3>
+                </div>
+                <div class="summary-card" style="text-align: center;">
+                  <p class="eyebrow">Vertical Bounce</p>
+                  <h3 id="inferVerticalBounce" style="font-size: 1.6rem;">--</h3>
+                </div>
+                <div class="summary-card" style="text-align: center;">
+                  <p class="eyebrow">Stride Asymmetry</p>
+                  <h3 id="inferStrideAsymmetry" style="font-size: 1.6rem;">--</h3>
+                </div>
+                <div class="summary-card" style="text-align: center;">
+                  <p class="eyebrow">Confidence</p>
+                  <h3 id="inferConfidence" style="font-size: 1.6rem;">--</h3>
+                </div>
+              </div>
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                <div>
+                  <h4 style="color: var(--text); margin-bottom: 8px;">Form Changes</h4>
+                  <div id="inferChangesList" style="font-size: 0.85rem; color: var(--muted);">Waiting for data...</div>
+                </div>
+                <div>
+                  <h4 style="color: var(--text); margin-bottom: 8px;">Coaching Cues</h4>
+                  <div id="inferCoachingCues" style="font-size: 0.85rem; color: var(--muted);">Waiting for data...</div>
+                </div>
+              </div>
+              <div style="margin-top: 16px;">
+                <h4 style="color: var(--text); margin-bottom: 8px;">Stream Progress</h4>
+                <div style="background: rgba(255,255,255,0.06); border-radius: 8px; height: 8px; overflow: hidden;">
+                  <div id="inferProgressBar" style="height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--amber)); border-radius: 8px; transition: width 0.3s;"></div>
+                </div>
+                <p id="inferProgressLabel" style="font-size: 0.78rem; color: var(--muted); margin-top: 4px;">0 / 0</p>
+              </div>
+            </div>
+          </div>
+
+        </article>
+      </section>
+
       <!-- ═══════════ TAB: AI Coach ═══════════ -->
       <section class="tab-pane" data-pane="coach" id="pane-coach">
         <div class="coach-grid">
@@ -924,6 +1036,10 @@
         <button class="tab" data-tab="history" type="button">
           <span class="tab-icon">🕒</span>
           <span class="tab-label">History</span>
+        </button>
+        <button class="tab" data-tab="calibrate" type="button">
+          <span class="tab-icon">🎯</span>
+          <span class="tab-label">Calibrate</span>
         </button>
         <button class="tab" data-tab="coach" type="button">
           <span class="tab-icon">🤖</span>

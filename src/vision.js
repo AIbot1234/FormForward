@@ -414,6 +414,102 @@ export function buildVisionPayload(frameAnalyses) {
   };
 }
 
+// ─── Video-derived cadence estimation ───
+// Detects foot-strike events by tracking ankle Y-position peaks across frames.
+// Each local minimum in ankle Y (highest screen position = lowest real position)
+// approximates a ground contact event. Two consecutive strikes = one stride.
+
+/**
+ * Estimate cadence (steps per minute) from a sequence of frame analyses.
+ * @param {Array} frameAnalyses - Array of { label, landmarks, angles, timestampMs }
+ * @param {number} videoFps - Frames per second of the source video
+ * @returns {{ estimatedCadenceSpm: number|null, strikeTimes: number[], strideIntervals: number[] }}
+ */
+export function estimateVideoCadence(frameAnalyses, videoFps = 30) {
+  const withLandmarks = frameAnalyses.filter(f => f.landmarks && f.landmarks.length >= 33);
+  if (withLandmarks.length < 4) return { estimatedCadenceSpm: null, strikeTimes: [], strideIntervals: [] };
+
+  // Track the lower of the two ankle Y positions per frame (higher Y = lower on screen = closer to ground)
+  const ankleYSeries = withLandmarks.map((f, i) => {
+    const lAnkle = f.landmarks[LM.L_ANKLE];
+    const rAnkle = f.landmarks[LM.R_ANKLE];
+    return {
+      index: i,
+      timestampMs: f.timestampMs ?? (i / videoFps) * 1000,
+      maxAnkleY: Math.max(lAnkle.y, rAnkle.y), // highest Y = lowest point = foot strike
+      leftAnkleY: lAnkle.y,
+      rightAnkleY: rAnkle.y
+    };
+  });
+
+  // Detect local maxima in ankle Y (foot strike = ankle at lowest real-world point = highest Y)
+  const strikeTimes = [];
+  for (let i = 1; i < ankleYSeries.length - 1; i++) {
+    const prev = ankleYSeries[i - 1].maxAnkleY;
+    const curr = ankleYSeries[i].maxAnkleY;
+    const next = ankleYSeries[i + 1].maxAnkleY;
+    if (curr > prev && curr > next) {
+      strikeTimes.push(ankleYSeries[i].timestampMs);
+    }
+  }
+
+  if (strikeTimes.length < 2) return { estimatedCadenceSpm: null, strikeTimes, strideIntervals: [] };
+
+  // Compute inter-strike intervals
+  const strideIntervals = [];
+  for (let i = 1; i < strikeTimes.length; i++) {
+    strideIntervals.push(strikeTimes[i] - strikeTimes[i - 1]);
+  }
+
+  // Average interval -> cadence
+  const avgIntervalMs = strideIntervals.reduce((s, v) => s + v, 0) / strideIntervals.length;
+  const estimatedCadenceSpm = avgIntervalMs > 0 ? round(60000 / avgIntervalMs) : null;
+
+  return { estimatedCadenceSpm, strikeTimes, strideIntervals };
+}
+
+/**
+ * Compute the 4 calibration heuristics from a set of frame analyses.
+ * These are the core features that get aligned with Garmin telemetry.
+ * @param {Array} frameAnalyses - Array of { angles, landmarks, timestampMs }
+ * @param {number} videoFps - Frames per second
+ * @returns {{ torsoLean: number|null, cadence: number|null, strideAsymmetry: number|null, verticalBounce: number|null, perFrame: Array }}
+ */
+export function computeCalibrationHeuristics(frameAnalyses, videoFps = 30) {
+  const withAngles = frameAnalyses.filter(f => f.angles);
+  if (!withAngles.length) return { torsoLean: null, cadence: null, strideAsymmetry: null, verticalBounce: null, perFrame: [] };
+
+  // Per-frame heuristics
+  const perFrame = withAngles.map((f, i) => {
+    const a = f.angles;
+    return {
+      timestampMs: f.timestampMs ?? (i / videoFps) * 1000,
+      torsoLean: a.trunkAngle,
+      verticalBounce: a.verticalOsc,
+      strideAsymmetry: round(Math.abs(a.leftKnee - a.rightKnee) + Math.abs(a.leftHipAnkle - a.rightHipAnkle), 1),
+      kneeSymmetry: round(Math.abs(a.leftKnee - a.rightKnee)),
+      hipAnkleSymmetry: round(Math.abs(a.leftHipAnkle - a.rightHipAnkle), 1)
+    };
+  });
+
+  // Aggregate
+  const avgTorso = perFrame.reduce((s, f) => s + (f.torsoLean || 0), 0) / perFrame.length;
+  const avgBounce = perFrame.reduce((s, f) => s + (f.verticalBounce || 0), 0) / perFrame.length;
+  const avgAsymmetry = perFrame.reduce((s, f) => s + (f.strideAsymmetry || 0), 0) / perFrame.length;
+
+  // Cadence from video
+  const cadenceResult = estimateVideoCadence(frameAnalyses, videoFps);
+
+  return {
+    torsoLean: round(avgTorso, 1),
+    cadence: cadenceResult.estimatedCadenceSpm,
+    strideAsymmetry: round(avgAsymmetry, 1),
+    verticalBounce: round(avgBounce, 1),
+    perFrame,
+    cadenceDetail: cadenceResult
+  };
+}
+
 // ─── Helpers ───
 
 function round(v, d = 0) {
